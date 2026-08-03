@@ -37,8 +37,11 @@ DOE_MS_URL = "https://www.diariooficial.ms.gov.br/"
 DIOGRANDE_EDICOES_URL = "https://diogrande.campogrande.ms.gov.br/edicoes/"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MonitorDiarioPessoal/1.0; "
-                  "uso pessoal para busca de palavras-chave)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
 }
 
 
