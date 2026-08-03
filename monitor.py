@@ -2,12 +2,16 @@
 Monitor de Diário Oficial - MS (Estadual) e Campo Grande (DIOGRANDE)
 
 O que este script faz, todo dia:
-1. Encontra a edição mais recente do Diário Oficial de MS (DOE-MS) e do
-   Diário Oficial de Campo Grande (DIOGRANDE).
-2. Baixa o PDF de cada um.
-3. Extrai o texto e procura pelas palavras-chave definidas em keywords.json.
-4. Se encontrar alguma, envia um alerta pro seu Telegram com o trecho e o link do PDF.
-5. Guarda em state.json quais edições já foram checadas, pra não repetir aviso.
+1. Encontra a edição mais recente do Diário Oficial de MS (DOE-MS), baixa,
+   extrai o texto e procura pelas palavras-chave em keywords.json.
+2. Para o DIOGRANDE (Campo Grande), como o site bloqueia acesso automático:
+   - Manda uma mensagem no Telegram com o link da página de edições, pedindo
+     pro usuário baixar o PDF do dia e mandar de volta pelo chat.
+   - Verifica se o usuário mandou algum PDF novo no chat do bot; se sim,
+     extrai o texto, procura as palavras-chave e responde com o resultado.
+3. Se encontrar alguma palavra-chave, envia um alerta pro Telegram com o
+   trecho e o link (ou nome do arquivo).
+4. Guarda em state.json o que já foi processado, pra não repetir aviso.
 
 Variáveis de ambiente necessárias (configuradas como "Secrets" no GitHub):
 - TELEGRAM_BOT_TOKEN
@@ -67,7 +71,6 @@ def send_telegram(message):
               "Mensagem não enviada:\n", message)
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    # Telegram limita a ~4096 caracteres por mensagem
     for i in range(0, len(message), 4000):
         chunk = message[i:i + 4000]
         resp = requests.post(url, data={
@@ -113,7 +116,6 @@ def find_matches(text, keywords):
             snippet = text[snippet_start:snippet_end].replace("\n", " ").strip()
             matches.append((kw, snippet))
             start = idx + len(kw_lower)
-            # limita a 3 ocorrências por palavra-chave por edição, pra não floodar
             if sum(1 for m in matches if m[0] == kw) >= 3:
                 break
     return matches
@@ -125,7 +127,6 @@ def get_latest_doems_edition():
     r = requests.get(DOE_MS_URL, headers=HEADERS, timeout=60)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    # Procura o primeiro link para um PDF na listagem de "Últimas Edições"
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.lower().endswith(".pdf") and "diario" in href.lower():
@@ -134,27 +135,89 @@ def get_latest_doems_edition():
     return None
 
 
-# ---------- DIOGRANDE (municipal) ----------
+# ---------- DIOGRANDE (municipal) - fluxo manual via Telegram ----------
 
-def get_latest_diogrande_edition():
-    try:
-        r = requests.get(DIOGRANDE_EDICOES_URL, headers=HEADERS, timeout=60)
-        r.raise_for_status()
-    except requests.exceptions.SSLError:
-        print("[DIOGRANDE] Aviso: certificado SSL inválido no site, "
-              "acessando sem verificação de certificado.")
-        r = requests.get(
-            DIOGRANDE_EDICOES_URL, headers=HEADERS, timeout=60, verify=False
+def get_telegram_updates(offset):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return [], offset
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {"timeout": 5}
+    if offset:
+        params["offset"] = offset
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    updates = data.get("result", [])
+    new_offset = offset
+    if updates:
+        new_offset = updates[-1]["update_id"] + 1
+    return updates, new_offset
+
+
+def download_telegram_file(file_id, dest):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    url = f"https://api.telegram.org/bot{token}/getFile"
+    resp = requests.get(url, params={"file_id": file_id}, timeout=30)
+    resp.raise_for_status()
+    file_path = resp.json()["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    r = requests.get(file_url, timeout=60)
+    r.raise_for_status()
+    with open(dest, "wb") as f:
+        f.write(r.content)
+    return dest
+
+
+def process_diogrande_manual(state, keywords, alerts):
+    # 1) Avisa uma vez por dia pedindo pro usuário mandar o PDF
+    today_key = f"diogrande_link_sent:{datetime.utcnow().date().isoformat()}"
+    if not state.get(today_key):
+        alerts.append(
+            "📎 *DIOGRANDE* - não consigo acessar automaticamente (o site bloqueia robôs).\n"
+            f"Acesse {DIOGRANDE_EDICOES_URL}, baixe o PDF da edição de hoje e "
+            "me mande esse arquivo aqui mesmo no Telegram que eu verifico pra você."
         )
-        r.raise_for_status()
+        state[today_key] = True
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.lower().endswith(".pdf"):
-            label = a.get_text(strip=True) or href
-            return {"label": label, "url": href}
-    return None
+    # 2) Verifica se o usuário já mandou algum PDF novo no chat
+    offset = state.get("telegram_offset")
+    try:
+        updates, new_offset = get_telegram_updates(offset)
+    except Exception as e:
+        print("Erro ao verificar mensagens do Telegram:", e)
+        return
+
+    for update in updates:
+        message = update.get("message", {})
+        document = message.get("document")
+        if not document:
+            continue
+        file_name = document.get("file_name", "arquivo.pdf")
+        if not file_name.lower().endswith(".pdf"):
+            continue
+
+        print(f"[DIOGRANDE] Arquivo recebido do usuário: {file_name}")
+        pdf_path = "/tmp/diogrande_manual.pdf"
+        try:
+            download_telegram_file(document["file_id"], pdf_path)
+            text = extract_text(pdf_path)
+        except Exception as e:
+            alerts.append(f"⚠️ Não consegui processar o arquivo {file_name}: {e}")
+            continue
+
+        matches = find_matches(text, keywords)
+        if matches:
+            lines = [f"📌 *DIOGRANDE (manual)* - {file_name}", ""]
+            for kw, snippet in matches:
+                lines.append(f"🔎 _{kw}_: ...{snippet}...")
+            alerts.append("\n".join(lines))
+        else:
+            alerts.append(
+                f"✅ *DIOGRANDE (manual)* - {file_name}: nenhuma palavra-chave encontrada."
+            )
+
+    state["telegram_offset"] = new_offset
 
 
 # ---------- fluxo principal ----------
@@ -187,7 +250,6 @@ def process_source(name, edition, state, keywords, alerts):
     else:
         print(f"[{name}] Nenhuma palavra-chave encontrada nesta edição.")
 
-    # marca como processada mesmo se não encontrou nada, pra não reprocessar
     state[key] = datetime.utcnow().isoformat()
 
 
@@ -206,18 +268,23 @@ def main():
         print("Erro ao consultar DOE-MS:", e)
     process_source("DOE-MS", doe, state, keywords, alerts)
 
+    # DIOGRANDE: tenta automático primeiro; se falhar, usa o fluxo manual
     try:
         diogrande = get_latest_diogrande_edition()
     except Exception as e:
         diogrande = None
-        print("Erro ao consultar DIOGRANDE:", e)
-    process_source("DIOGRANDE", diogrande, state, keywords, alerts)
+        print("Erro ao consultar DIOGRANDE automaticamente:", e)
+
+    if diogrande:
+        process_source("DIOGRANDE", diogrande, state, keywords, alerts)
+    else:
+        process_diogrande_manual(state, keywords, alerts)
 
     # limpa state antigo (mais de 60 dias) pra não crescer pra sempre
     cutoff = datetime.utcnow() - timedelta(days=60)
     state = {
         k: v for k, v in state.items()
-        if _safe_parse(v) is None or _safe_parse(v) > cutoff
+        if not isinstance(v, str) or _safe_parse(v) is None or _safe_parse(v) > cutoff
     }
     save_json(STATE_FILE, state)
 
