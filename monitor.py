@@ -21,7 +21,9 @@ import sys
 from datetime import datetime, timedelta
 
 import requests
-from bs4 import BeautifulSoup
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from bs4 import BeautifulSou
 
 try:
     import pdfplumber
@@ -132,8 +134,17 @@ def get_latest_doems_edition():
 # ---------- DIOGRANDE (municipal) ----------
 
 def get_latest_diogrande_edition():
-    r = requests.get(DIOGRANDE_EDICOES_URL, headers=HEADERS, timeout=60)
-    r.raise_for_status()
+    try:
+        r = requests.get(DIOGRANDE_EDICOES_URL, headers=HEADERS, timeout=60)
+        r.raise_for_status()
+    except requests.exceptions.SSLError:
+        print("[DIOGRANDE] Aviso: certificado SSL inválido no site, "
+              "acessando sem verificação de certificado.")
+        r = requests.get(
+            DIOGRANDE_EDICOES_URL, headers=HEADERS, timeout=60, verify=False
+        )
+        r.raise_for_status()
+
     soup = BeautifulSoup(r.text, "html.parser")
     for a in soup.find_all("a", href=True):
         href = a["href"]
